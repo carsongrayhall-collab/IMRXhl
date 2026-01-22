@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IMRX 10-minute Prev-Low / Prev-High strategy (no lookahead) with Kelly sizing
+2.0 Bootstrap IMRX 10-minute Prev-Low / Prev-High strategy (no lookahead) with Kelly sizing
 and Alpaca order execution.
 
 Exact logic implemented:
@@ -63,6 +63,9 @@ PAPER = os.getenv("ALPACA_PAPER", "1").strip() != "0"
 
 KELLY_MULT = float(os.getenv("KELLY_MULT", "1.0"))
 MAX_FRACTION = float(os.getenv("MAX_FRACTION", "1.0"))
+
+# Bootstrap sizing (hardwired)
+BOOTSTRAP_FRACTION = 0.02  # 2% of equity until Kelly is ready
 
 # Safety / sanity defaults
 MIN_KELLY_TRADES = 30
@@ -275,7 +278,12 @@ class AlpacaIMRXBot:
     def compute_order_qty(self, price: float) -> int:
         # Kelly sizing based on realized trade returns
         f_star = compute_kelly_fraction(self.state.trade_returns)
-        f = max(0.0, min(MAX_FRACTION, f_star)) * KELLY_MULT
+
+        # Bootstrap: until Kelly has enough trade history, risk a small fixed fraction
+        if f_star == 0.0:
+            f = BOOTSTRAP_FRACTION
+        else:
+            f = max(0.0, min(MAX_FRACTION, f_star)) * KELLY_MULT
 
         equity = self.get_equity()
         notional = equity * f
