@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-2.0 Bootstrap IMRX 10-minute Prev-Low / Prev-High strategy (no lookahead) with Kelly sizing
+2.1 Adds sell funcitonality IMRX 10-minute Prev-Low / Prev-High strategy (no lookahead) with Kelly sizing
 and Alpaca order execution.
 
 Exact logic implemented:
@@ -64,8 +64,8 @@ PAPER = os.getenv("ALPACA_PAPER", "1").strip() != "0"
 KELLY_MULT = float(os.getenv("KELLY_MULT", "1.0"))
 MAX_FRACTION = float(os.getenv("MAX_FRACTION", "1.0"))
 
-# Bootstrap sizing (hardwired)
-BOOTSTRAP_FRACTION = 0.02  # 2% of equity until Kelly is ready
+# Hardwired bootstrap sizing (2% of equity) until Kelly is ready
+BOOTSTRAP_FRACTION = 0.02
 
 # Safety / sanity defaults
 MIN_KELLY_TRADES = 30
@@ -279,7 +279,7 @@ class AlpacaIMRXBot:
         # Kelly sizing based on realized trade returns
         f_star = compute_kelly_fraction(self.state.trade_returns)
 
-        # Bootstrap: until Kelly has enough trade history, risk a small fixed fraction
+        # Bootstrap to avoid Kelly "deadlock" at startup (no trades -> Kelly=0 -> qty=0 forever)
         if f_star == 0.0:
             f = BOOTSTRAP_FRACTION
         else:
@@ -454,6 +454,79 @@ class AlpacaIMRXBot:
             # Advance block_end forward to prevent repeated triggers (until next tick sets it)
             self.state.block_end = now + timedelta(seconds=1)
 
+
+    async def reconcile_broker_state(self):
+        """Periodically reconcile local state with Alpaca brokerage.
+
+        This fixes cases where trade update events are missed/delayed, which can
+        otherwise prevent placing the SELL order and allow repeated buys.
+        """
+        async with self._lock:
+            # 1) Check actual open position
+            pos_qty = 0
+            pos_avg = None
+            try:
+                pos = self.trading.get_open_position(SYMBOL)
+                pos_qty = int(float(pos.qty))
+                pos_avg = float(pos.avg_entry_price) if getattr(pos, "avg_entry_price", None) else None
+            except Exception:
+                pos_qty = 0
+                pos_avg = None
+
+            if pos_qty > 0:
+                # We are long in reality
+                if not self.state.in_position or self.state.position_qty != pos_qty:
+                    self._log(f"RECONCILE: detected live position qty={pos_qty} avg={pos_avg}")
+                self.state.in_position = True
+                self.state.position_qty = pos_qty
+                if self.state.last_entry_price is None and pos_avg is not None:
+                    self.state.last_entry_price = pos_avg
+                    self.state.last_entry_qty = pos_qty
+
+                # Cancel any working buy order to prevent stacking
+                if self.state.buy_order_id:
+                    self._log(f"RECONCILE: cancelling buy order {self.state.buy_order_id} (position already open)")
+                    self.cancel_order(self.state.buy_order_id)
+                    self.state.buy_order_id = None
+
+                # 2) Detect if a sell order is already working
+                working_sell_id = None
+                try:
+                    orders = self.trading.get_orders()
+                    for o in orders:
+                        try:
+                            if str(getattr(o, "symbol", "")).upper() != SYMBOL:
+                                continue
+                            if str(getattr(o, "side", "")).lower() == "sell" and str(getattr(o, "status", "")).lower() in ("new", "accepted", "held", "partially_filled"):
+                                working_sell_id = str(o.id)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                if working_sell_id:
+                    self.state.sell_order_id = working_sell_id
+                else:
+                    # No sell working: place one at the strategy resistance for the CURRENT block
+                    target = self.state.resistance
+                    if target is None:
+                        # fall back to last completed 10m high if available
+                        if self.state.prev_10m is not None:
+                            target = float(self.state.prev_10m.high)
+                    if target is not None:
+                        self._log(f"RECONCILE: no sell working; placing SELL for qty={pos_qty} @ {target:.4f}")
+                        self.submit_sell_limit(pos_qty, target)
+            else:
+                # No open position in reality
+                if self.state.in_position or self.state.position_qty != 0:
+                    self._log("RECONCILE: no live position; resetting local position state")
+                self.state.in_position = False
+                self.state.position_qty = 0
+                self.state.sell_order_id = None
+                self.state.last_entry_price = None
+                self.state.last_entry_qty = 0
+
     # ------------- stream callbacks -------------
     async def on_trade(self, trade):
         async with self._lock:
@@ -538,8 +611,13 @@ class AlpacaIMRXBot:
 
         # Periodic time-stop watcher
         async def watcher():
+            last_reconcile = utc_now()
             while True:
                 await self.check_time_stop()
+                # Reconcile every 15 seconds
+                if (utc_now() - last_reconcile).total_seconds() >= 15:
+                    await self.reconcile_broker_state()
+                    last_reconcile = utc_now()
                 await asyncio.sleep(1)
 
         await asyncio.gather(
@@ -556,3 +634,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
